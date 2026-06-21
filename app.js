@@ -1,38 +1,31 @@
 const OSLO_S = L.latLng(59.9111, 10.7528);
-const BOUNDS = L.latLngBounds([59.66, 10.2], [60.17, 11.3]);
+const NORWAY_BOUNDS = L.latLngBounds([57.5, 3.5], [71.6, 32.0]);
 const API_URL = document.querySelector('meta[name="travel-time-api"]').content;
 const WIDTH = 320;
 const HEIGHT = 240;
 const MAX_MINUTES = 60;
 const TIME_STEPS = [0, 10, 20, 30, 40, 50, 60];
+const CLIENT_ID = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
+const MOVE_DEBOUNCE_MS = 300;
 
-const COLOR_SCALES = {
-  viridis: ["#440154", "#414487", "#2a788e", "#22a884", "#5ec962", "#aadc32", "#fde725"],
-  magma: ["#000004", "#1c1044", "#4f127b", "#812581", "#a72370", "#d64868", "#fb8861"],
-  inferno: ["#000004", "#1f0c48", "#550f6d", "#88226a", "#ad3358", "#e66639", "#fcffa4"],
-  turbo: ["#30123b", "#255ab5", "#1ea2a5", "#48ce5a", "#96e73e", "#f0a022", "#f54800"],
-  cividis: ["#00204c", "#00396d", "#275277", "#5c6b70", "#7c7a68", "#bda654", "#ead743"],
-  blueRed: ["#313695", "#4575b4", "#74add1", "#abd9e9", "#e8baa0", "#e36f59", "#d73027"],
-  greyscale: ["#141414", "#3a3a3a", "#5f5f5f", "#868686", "#a4a4a4", "#d0d0d0", "#f5f5f5"],
-};
+const VIRIDIS = ["#440154", "#414487", "#2a788e", "#22a884", "#5ec962", "#aadc32", "#fde725"];
 
-const paletteButtons = [...document.querySelectorAll(".palette-option")];
-const legend = document.querySelector(".legend-gradient");
 const legendTicks = document.querySelector(".legend-ticks");
-const paletteName = document.querySelector("#palette-name");
 const startCoordinates = document.querySelector("#start-coordinates");
 const fieldValue = document.querySelector("#field-value");
 const engineStatus = document.querySelector("#engine-status");
-const requestedScale = new URLSearchParams(location.search).get("scale");
-let activeScale = COLOR_SCALES[requestedScale] ? requestedScale : "viridis";
+const transportModes = [...document.querySelectorAll('input[name="transport-mode"]')];
 let startPoint = OSLO_S;
 let currentGrid;
+let currentBounds;
 let activeRequest;
+let requestSequence = 0;
+let moveRequestTimer;
 
 const map = L.map("map", {
   zoomControl: false,
-  minZoom: 9,
-  maxBounds: BOUNDS.pad(0.18),
+  minZoom: 4,
+  maxBounds: NORWAY_BOUNDS.pad(0.12),
   maxBoundsViscosity: 0.8,
 }).setView(OSLO_S, 11);
 
@@ -43,9 +36,11 @@ L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
   className: "greyscale-tiles",
 }).addTo(map);
 
-const blank = document.createElement("canvas");
-blank.width = blank.height = 1;
-const heatLayer = L.imageOverlay(blank.toDataURL(), BOUNDS, {
+const heatCanvas = document.createElement("canvas");
+heatCanvas.width = WIDTH;
+heatCanvas.height = HEIGHT;
+const heatContext = heatCanvas.getContext("2d");
+const heatLayer = L.imageOverlay(heatCanvas.toDataURL(), map.getBounds(), {
   opacity: 0.8,
   interactive: false,
 }).addTo(map);
@@ -64,57 +59,42 @@ function rgb(hex) {
   return [1, 3, 5].map((index) => parseInt(hex.slice(index, index + 2), 16));
 }
 
-function colourAt(minutes) {
-  const colours = COLOR_SCALES[activeScale];
-  const bucket = Math.min(Math.floor(Math.max(0, minutes) / 10), colours.length - 2);
-  return rgb(colours[bucket]);
+function morningDepartureTime() {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en", {
+      timeZone: "Europe/Oslo",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts().map(({ type, value }) => [type, value]),
+  );
+  return `${parts.year}-${parts.month}-${parts.day}T08:00:00`;
 }
 
-function gradient(colours) {
-  const stops = colours.slice(0, -1).flatMap((colour, index) => {
-    const start = (TIME_STEPS[index] / MAX_MINUTES) * 100;
-    const end = (TIME_STEPS[index + 1] / MAX_MINUTES) * 100;
-    return [`${colour} ${start}%`, `${colour} ${end}%`];
-  });
-  return `linear-gradient(90deg, ${stops.join(", ")})`;
-}
-
-function renderField(minutes) {
-  const canvas = document.createElement("canvas");
-  canvas.width = WIDTH;
-  canvas.height = HEIGHT;
-  const context = canvas.getContext("2d");
-  const image = context.createImageData(WIDTH, HEIGHT);
+function renderField(minutes, bounds) {
+  const colours = VIRIDIS.map(rgb);
+  const image = heatContext.createImageData(WIDTH, HEIGHT);
 
   minutes.forEach((minute, index) => {
     if (minute > MAX_MINUTES) return;
-    image.data.set([...colourAt(minute), 255], index * 4);
+    const bucket = Math.min(Math.floor(Math.max(0, minute) / 10), colours.length - 2);
+    image.data.set([...colours[bucket], 255], index * 4);
   });
 
-  context.putImageData(image, 0, 0);
-  heatLayer.setUrl(canvas.toDataURL("image/png"));
+  heatContext.putImageData(image, 0, 0);
+  heatLayer.setUrl(heatCanvas.toDataURL("image/png"));
+  heatLayer.setBounds(bounds);
   currentGrid = minutes;
-}
-
-function updatePalette() {
-  legend.style.background = gradient(COLOR_SCALES[activeScale]);
-  paletteButtons.forEach((button) => {
-    const selected = button.dataset.scale === activeScale;
-    button.classList.toggle("is-active", selected);
-    button.setAttribute("aria-checked", String(selected));
-    button.tabIndex = selected ? 0 : -1;
-    if (selected) paletteName.textContent = button.textContent.trim();
-  });
-  if (currentGrid) renderField(currentGrid);
+  currentBounds = bounds;
 }
 
 function sampleGrid(lat, lng) {
-  if (!currentGrid || !BOUNDS.contains([lat, lng])) return null;
+  if (!currentGrid || !currentBounds?.contains([lat, lng])) return null;
   const x = Math.min(WIDTH - 1, Math.floor(
-    (lng - BOUNDS.getWest()) / (BOUNDS.getEast() - BOUNDS.getWest()) * WIDTH,
+    (lng - currentBounds.getWest()) / (currentBounds.getEast() - currentBounds.getWest()) * WIDTH,
   ));
   const y = Math.min(HEIGHT - 1, Math.floor(
-    (BOUNDS.getNorth() - lat) / (BOUNDS.getNorth() - BOUNDS.getSouth()) * HEIGHT,
+    (currentBounds.getNorth() - lat) / (currentBounds.getNorth() - currentBounds.getSouth()) * HEIGHT,
   ));
   return currentGrid[y * WIDTH + x];
 }
@@ -125,17 +105,36 @@ function setStatus(text, state) {
 }
 
 async function requestTravelTimes() {
+  if (map.getZoom() < 8) {
+    activeRequest?.abort();
+    currentGrid = undefined;
+    currentBounds = undefined;
+    heatLayer.setOpacity(0);
+    fieldValue.textContent = "Klikk nær en by for å beregne";
+    return;
+  }
+
   activeRequest?.abort();
   const controller = new AbortController();
   activeRequest = controller;
   fieldValue.textContent = "Beregner …";
   setStatus("Beregner", "loading");
 
+  const requestBounds = map.getBounds().pad(0.04);
   const request = {
+    client_id: CLIENT_ID,
+    request_id: ++requestSequence,
     origin: { lat: startPoint.lat, lng: startPoint.lng },
-    bounds: { south: BOUNDS.getSouth(), west: BOUNDS.getWest(), north: BOUNDS.getNorth(), east: BOUNDS.getEast() },
+    bounds: {
+      south: requestBounds.getSouth(),
+      west: requestBounds.getWest(),
+      north: requestBounds.getNorth(),
+      east: requestBounds.getEast(),
+    },
     width: WIDTH,
     height: HEIGHT,
+    mode: transportModes.find((input) => input.checked).value,
+    departure_time: morningDepartureTime(),
   };
 
   try {
@@ -145,10 +144,12 @@ async function requestTravelTimes() {
       signal: controller.signal,
     });
     const payload = await response.json();
+    if (activeRequest !== controller) return;
     if (!response.ok || payload.minutes?.length !== WIDTH * HEIGHT) {
       throw new Error(payload.error ?? "Ugyldig svar fra motoren");
     }
-    renderField(payload.minutes);
+    heatLayer.setOpacity(0.8);
+    renderField(payload.minutes, requestBounds);
     fieldValue.textContent = "Flytt pekeren over kartet";
     setStatus("Tilkoblet", "connected");
   } catch (error) {
@@ -161,11 +162,20 @@ async function requestTravelTimes() {
   }
 }
 
+function scheduleTravelTimes() {
+  clearTimeout(moveRequestTimer);
+  moveRequestTimer = setTimeout(requestTravelTimes, MOVE_DEBOUNCE_MS);
+}
+
 function setStartPoint(point, label) {
   startPoint = L.latLng(point);
   marker.setLatLng(startPoint);
   startCoordinates.textContent = label ?? `${startPoint.lat.toFixed(4)}° N, ${startPoint.lng.toFixed(4)}° Ø`;
-  requestTravelTimes();
+  if (map.getZoom() < 8) {
+    map.setView(startPoint, 9);
+  } else {
+    requestTravelTimes();
+  }
 }
 
 legendTicks.replaceChildren(...TIME_STEPS.map((minute) => {
@@ -174,15 +184,8 @@ legendTicks.replaceChildren(...TIME_STEPS.map((minute) => {
   return tick;
 }));
 
-paletteButtons.forEach((button) => {
-  button.querySelector(".palette-swatch").style.background = gradient(COLOR_SCALES[button.dataset.scale]);
-  button.addEventListener("click", () => {
-    activeScale = button.dataset.scale;
-    updatePalette();
-  });
-});
-
 map.on("click", (event) => setStartPoint(event.latlng));
+map.on("moveend", scheduleTravelTimes);
 map.on("mousemove", (event) => {
   const minutes = sampleGrid(event.latlng.lat, event.latlng.lng);
   if (minutes !== null) {
@@ -190,10 +193,6 @@ map.on("mousemove", (event) => {
   }
 });
 marker.on("dragend", () => setStartPoint(marker.getLatLng()));
-document.querySelector("#reset-start").addEventListener("click", () => {
-  setStartPoint(OSLO_S, "Oslo S");
-  map.flyTo(OSLO_S, 11);
-});
+transportModes.forEach((input) => input.addEventListener("change", requestTravelTimes));
 
-updatePalette();
 requestTravelTimes();

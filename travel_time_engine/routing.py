@@ -4,28 +4,48 @@ from __future__ import annotations
 
 import datetime as dt
 import functools
+import gc
 import hashlib
+import json
 import math
 import os
 import shutil
 import subprocess
 import tempfile
 import threading
+import urllib.request
 import warnings
+import zipfile
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 
 DATA_DIRECTORY_ENVIRONMENT_VARIABLE = "R5_DATA_DIR"
 DEPARTURE_TIME_ENVIRONMENT_VARIABLE = "R5_DEPARTURE_TIME"
-DEFAULT_DATA_DIRECTORY = Path(__file__).resolve().parent.parent / "data" / "oslo"
+DATA_ROOT = Path(__file__).resolve().parent.parent / "data"
+DEFAULT_REGIONS_DIRECTORY = DATA_ROOT / "regions"
+DEFAULT_DATA_DIRECTORY = DATA_ROOT / "oslo"
+REGIONS_MANIFEST = "regions.json"
 DEFAULT_TIME_ZONE = "Europe/Oslo"
+DEFAULT_DEPARTURE_HOUR = 8
 MAX_TRAVEL_TIME_MINUTES = 60
 ROUTING_HORIZON_MINUTES = 70
 UNREACHABLE_MINUTES = MAX_TRAVEL_TIME_MINUTES + 1
-MAX_ROUTING_CELLS = 76_800
+# Route a 200x150 grid for the 4:3 browser raster, then upsample. Asking R5
+# for all 76,800 display pixels roughly doubles latency without a visible gain.
+MAX_ROUTING_CELLS = 30_000
 JUST_IN_TIME_PERCENTILE = 1
+NATURAL_EARTH_LAND_URL = (
+    "https://naturalearth.s3.amazonaws.com/10m_physical/ne_10m_land.zip"
+)
+LOCAL_COASTLINE_DISTANCE_METRES = 2_000
 _R5_LOCK = threading.Lock()
+_TRANSPORT_NETWORK = None
+_TRANSPORT_NETWORK_DIRECTORY = None
+
+
+class RoutingCancelled(Exception):
+    """Raised when a newer browser request supersedes queued routing work."""
 
 
 def _mercator_y(latitude: float) -> float:
@@ -101,7 +121,12 @@ def _routing_libraries():
 
 def _data_directory() -> Path:
     configured = os.environ.get(DATA_DIRECTORY_ENVIRONMENT_VARIABLE)
-    path = Path(configured).expanduser() if configured else DEFAULT_DATA_DIRECTORY
+    if configured:
+        path = Path(configured).expanduser()
+    elif (DEFAULT_REGIONS_DIRECTORY / REGIONS_MANIFEST).is_file():
+        path = DEFAULT_REGIONS_DIRECTORY
+    else:
+        path = DEFAULT_DATA_DIRECTORY
     path = path.resolve()
 
     if not path.is_dir():
@@ -112,6 +137,77 @@ def _data_directory() -> Path:
         )
 
     return path
+
+
+def _contains(bounds, longitude: float, latitude: float) -> bool:
+    west, south, east, north = bounds
+    return west <= longitude <= east and south <= latitude <= north
+
+
+@functools.lru_cache(maxsize=4)
+def _load_regions(data_directory: Path) -> tuple[dict, ...]:
+    """Load a routing-region manifest, or wrap a legacy directory."""
+
+    manifest_path = data_directory / REGIONS_MANIFEST
+
+    if not manifest_path.is_file():
+        return (
+            {
+                "id": data_directory.name,
+                "name": data_directory.name,
+                "core_bounds": [-180, -90, 180, 90],
+                "data_bounds": [-180, -90, 180, 90],
+                "directory": data_directory,
+            },
+        )
+
+    with manifest_path.open(encoding="utf-8") as manifest_file:
+        manifest = json.load(manifest_file)
+
+    regions = []
+    for item in manifest.get("regions", []):
+        region_id = item["id"]
+        core_bounds = item["core_bounds"]
+        data_bounds = item["data_bounds"]
+
+        if len(core_bounds) != 4 or len(data_bounds) != 4:
+            raise ValueError(f"Region {region_id!r} must have four-value bounds")
+
+        region_directory = (data_directory / item.get("directory", region_id)).resolve()
+        if not region_directory.is_dir():
+            raise FileNotFoundError(
+                f"Routing data for region {region_id!r} does not exist: "
+                f"{region_directory}. Run 'py -m travel_time_engine.build_regions'."
+            )
+
+        regions.append(
+            {
+                "id": region_id,
+                "name": item.get("name", region_id),
+                "core_bounds": core_bounds,
+                "data_bounds": data_bounds,
+                "directory": region_directory,
+            }
+        )
+
+    if not regions:
+        raise ValueError(f"No regions are defined in {manifest_path}")
+
+    return tuple(regions)
+
+
+def _region_for_origin(data_directory: Path, origin) -> dict:
+    longitude = float(origin["lng"])
+    latitude = float(origin["lat"])
+
+    for region in _load_regions(data_directory):
+        if _contains(region["core_bounds"], longitude, latitude):
+            return region
+
+    raise ValueError(
+        f"No routing region covers {latitude:.5f}, {longitude:.5f}. "
+        f"Check {data_directory / REGIONS_MANIFEST}."
+    )
 
 
 def _coastline_cache_path(osm_path: Path) -> Path:
@@ -197,14 +293,54 @@ def _extract_coastline(osm_path: Path) -> Path:
     return cache_path
 
 
-class _CoastlineMask:
-    """Classify points using OSM's directed coastline; land is on the left."""
+def _natural_earth_land_path() -> Path:
+    """Download and cache closed land polygons used away from local coastlines."""
 
-    def __init__(self, coastline_path: Path, geopandas, shapely):
+    cache_directory = Path(tempfile.gettempdir()) / "reisetidskart"
+    cache_directory.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_directory / "ne_10m_land.zip"
+
+    if cache_path.is_file():
+        return cache_path
+
+    temporary_path = cache_path.with_suffix(".tmp.zip")
+
+    try:
+        with urllib.request.urlopen(NATURAL_EARTH_LAND_URL, timeout=60) as response:
+            with temporary_path.open("wb") as destination:
+                shutil.copyfileobj(response, destination)
+
+        with zipfile.ZipFile(temporary_path) as archive:
+            if archive.testzip() is not None:
+                raise RuntimeError("The downloaded Natural Earth archive is corrupt")
+
+        temporary_path.replace(cache_path)
+    except Exception as error:
+        raise RuntimeError(
+            "Unable to load the Natural Earth land mask. Check the network "
+            f"connection or place ne_10m_land.zip in {cache_directory}."
+        ) from error
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+    return cache_path
+
+
+class _CoastlineMask:
+    """Classify land globally, refining it near detailed OSM coastlines."""
+
+    def __init__(self, coastline_path: Path, land_path: Path, geopandas, shapely):
         import numpy
         from pyproj import Transformer
 
-        coastlines = geopandas.read_file(coastline_path).to_crs("EPSG:25832")
+        coastlines = geopandas.read_file(coastline_path)
+        west, south, east, north = coastlines.total_bounds
+        land = geopandas.read_file(f"zip://{land_path}")
+        regional_envelope = shapely.box(west - 5, south - 5, east + 5, north + 5)
+        land.geometry = shapely.intersection(land.geometry.array, regional_envelope)
+        land = land[~land.geometry.is_empty].copy()
+        coastlines = coastlines.to_crs("EPSG:25832")
+        land = land.to_crs("EPSG:25832")
         segments = []
 
         for geometry in coastlines.geometry:
@@ -239,6 +375,7 @@ class _CoastlineMask:
         self._tree = shapely.STRtree(segments)
         self._starts = numpy.asarray([segment.coords[0] for segment in segments])
         self._ends = numpy.asarray([segment.coords[1] for segment in segments])
+        self._land = shapely.union_all(shapely.make_valid(land.geometry))
 
     def covers_coordinates(self, longitudes, latitudes):
         """Return a boolean array; OSM coastlines have land on their left."""
@@ -251,6 +388,12 @@ class _CoastlineMask:
             interleaved=False,
         )
 
+        # A regional PBF normally contains only a fragment of the world's
+        # coastline. Using its nearest segment everywhere makes distant sea
+        # inherit the side of an arbitrary extract-edge segment. Closed global
+        # polygons provide the baseline; directed OSM geometry is precise
+        # enough to override it only in the immediate coastal neighbourhood.
+        result = self._shapely.covered_by(projected, self._land)
         nearest = self._tree.nearest(projected)
         coordinates = self._shapely.get_coordinates(projected)
         starts = self._starts[nearest]
@@ -261,26 +404,75 @@ class _CoastlineMask:
             - (ends[:, 1] - starts[:, 1]) * (coordinates[:, 0] - starts[:, 0])
         )
 
-        return cross_product >= 0
+        nearest_segments = self._numpy.asarray(self._segments, dtype=object)[nearest]
+        local = self._shapely.distance(projected, nearest_segments) <= (
+            LOCAL_COASTLINE_DISTANCE_METRES
+        )
+
+        return self._numpy.where(local, cross_product >= 0, result)
+
+    def covers(self, longitude: float, latitude: float) -> bool:
+        return bool(self.covers_coordinates([longitude], [latitude])[0])
+
+
+class _LandMask:
+    """Fast national land mask without fragile directed-coastline overrides."""
+
+    def __init__(self, land_path: Path, geopandas, shapely):
+        import numpy
+
+        land = geopandas.read_file(f"zip://{land_path}")
+        norway_envelope = shapely.box(0, 55, 35, 82)
+        land.geometry = shapely.intersection(land.geometry.array, norway_envelope)
+        land = land[~land.geometry.is_empty]
+
+        self._numpy = numpy
+        self._shapely = shapely
+        self._land = shapely.union_all(shapely.make_valid(land.geometry))
+
+    def covers_coordinates(self, longitudes, latitudes):
+        points = self._shapely.points(longitudes, latitudes)
+        return self._shapely.covered_by(points, self._land)
 
     def covers(self, longitude: float, latitude: float) -> bool:
         return bool(self.covers_coordinates([longitude], [latitude])[0])
 
 
 @functools.lru_cache(maxsize=1)
-def _load_coastline_mask(data_directory: Path):
+def _load_coastline_mask():
     geopandas, _, shapely = _routing_libraries()
-    osm_files = sorted(data_directory.glob("*.osm.pbf"))
+    return _LandMask(
+        _natural_earth_land_path(),
+        geopandas,
+        shapely,
+    )
 
-    if not osm_files:
-        raise FileNotFoundError(f"No .osm.pbf file found in {data_directory}")
 
-    return _CoastlineMask(_extract_coastline(osm_files[0]), geopandas, shapely)
-
-
-@functools.lru_cache(maxsize=1)
 def _load_transport_network(data_directory: Path):
-    """Build the expensive R5 network once and reuse it between requests."""
+    """Keep one R5 region resident, releasing it before loading another."""
+
+    global _TRANSPORT_NETWORK, _TRANSPORT_NETWORK_DIRECTORY
+
+    if (
+        _TRANSPORT_NETWORK is not None
+        and _TRANSPORT_NETWORK_DIRECTORY == data_directory
+    ):
+        return _TRANSPORT_NETWORK
+
+    # functools.lru_cache builds a replacement before evicting the old value,
+    # briefly requiring enough RAM for two R5 networks. Drop the old Java
+    # object first, which matters on the 16 GiB target machine.
+    _TRANSPORT_NETWORK = None
+    _TRANSPORT_NETWORK_DIRECTORY = None
+    gc.collect()
+
+    try:
+        import jpype
+
+        if jpype.isJVMStarted():
+            jpype.JClass("java.lang.System").gc()
+    except (ImportError, RuntimeError):
+        pass
 
     _, r5py, _ = _routing_libraries()
     osm_files = sorted(data_directory.glob("*.osm.pbf"))
@@ -299,11 +491,15 @@ def _load_transport_network(data_directory: Path):
             category=RuntimeWarning,
         )
 
-        return r5py.TransportNetwork(
+        network = r5py.TransportNetwork(
             osm_files[0],
             gtfs_files,
             allow_errors=True,
         )
+
+    _TRANSPORT_NETWORK = network
+    _TRANSPORT_NETWORK_DIRECTORY = data_directory
+    return network
 
 
 def _parse_departure_time(value: dt.datetime | str | None) -> dt.datetime:
@@ -313,7 +509,13 @@ def _parse_departure_time(value: dt.datetime | str | None) -> dt.datetime:
         value = os.environ.get(DEPARTURE_TIME_ENVIRONMENT_VARIABLE)
 
     if value is None:
-        return dt.datetime.now(ZoneInfo(DEFAULT_TIME_ZONE)).replace(tzinfo=None)
+        return dt.datetime.now(ZoneInfo(DEFAULT_TIME_ZONE)).replace(
+            hour=DEFAULT_DEPARTURE_HOUR,
+            minute=0,
+            second=0,
+            microsecond=0,
+            tzinfo=None,
+        )
 
     if isinstance(value, str):
         try:
@@ -521,8 +723,14 @@ def compute_grid(
     mode="public_transport",
     departure_time=None,
     transport_network=None,
+    cancelled=None,
 ):
     """Return R5 travel times in north-west, row-major raster order."""
+
+    cancelled = cancelled or (lambda: False)
+
+    if cancelled():
+        raise RoutingCancelled
 
     if not isinstance(width, int) or not isinstance(height, int):
         raise TypeError("width and height must be integers")
@@ -531,8 +739,13 @@ def compute_grid(
         raise ValueError("width and height must both be at least 2")
 
     geopandas, r5py, shapely = _routing_libraries()
-    data_directory = _data_directory()
-    coastline_mask = _load_coastline_mask(data_directory)
+    data_root = _data_directory()
+    region = _region_for_origin(data_root, origin)
+    data_directory = region["directory"]
+    coastline_mask = _load_coastline_mask()
+
+    if cancelled():
+        raise RoutingCancelled
 
     if not coastline_mask.covers(origin["lng"], origin["lat"]):
         return [UNREACHABLE_MINUTES] * (width * height)
@@ -547,20 +760,32 @@ def compute_grid(
         geopandas,
         shapely,
     )
+    departure = _parse_departure_time(departure_time)
 
     with _R5_LOCK:
+        # Several HTTP threads may be waiting here. Only the newest request
+        # from a browser should get to perform an expensive R5 calculation.
+        if cancelled():
+            raise RoutingCancelled
+
         if transport_network is None:
             transport_network = _load_transport_network(data_directory)
+
+        if cancelled():
+            raise RoutingCancelled
 
         travel_times = r5py.TravelTimeMatrix(
             transport_network,
             origins=origins,
             destinations=destinations,
-            departure=_parse_departure_time(departure_time),
+            departure=departure,
             percentiles=[JUST_IN_TIME_PERCENTILE],
             transport_modes=_transport_modes(r5py, mode),
             max_time=dt.timedelta(minutes=ROUTING_HORIZON_MINUTES),
         )
+
+    if cancelled():
+        raise RoutingCancelled
 
     routed = _matrix_minutes(travel_times, routing_width * routing_height)
 

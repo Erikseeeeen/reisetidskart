@@ -1,21 +1,54 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import threading
 import traceback
 
-from .dummy import _data_directory, _routing_libraries, compute_grid
+from .routing import (
+    RoutingCancelled,
+    _data_directory,
+    _routing_libraries,
+    compute_grid,
+)
 
 
-class Handler(BaseHTTPRequestHandler):
+class _RequestTracker:
+    """Track the newest request from each browser session."""
+
+    def __init__(self):
+        self._latest = {}
+        self._lock = threading.Lock()
+
+    def register(self, client_id, request_id):
+        if not isinstance(client_id, str) or not isinstance(request_id, int):
+            return lambda: False
+
+        with self._lock:
+            self._latest[client_id] = max(
+                request_id,
+                self._latest.get(client_id, request_id),
+            )
+
+        def superseded():
+            with self._lock:
+                return self._latest.get(client_id) != request_id
+
+        return superseded
+
+
+_REQUESTS = _RequestTracker()
+
+
+class TravelTimeHandler(BaseHTTPRequestHandler):
     def send_json(self, status, payload):
         response = json.dumps(payload, allow_nan=False).encode()
-        self.send_response(status)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(response)))
-        self.end_headers()
         try:
+            self.send_response(status)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
             self.wfile.write(response)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
             # Moving the marker aborts the obsolete browser request while R5
             # may still be finishing it.
             pass
@@ -28,6 +61,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
             request = json.loads(self.rfile.read(content_length))
+            cancelled = _REQUESTS.register(
+                request.get("client_id"),
+                request.get("request_id"),
+            )
             minutes = compute_grid(
                 request["origin"],
                 request["bounds"],
@@ -35,7 +72,11 @@ class Handler(BaseHTTPRequestHandler):
                 request["height"],
                 mode=request.get("mode", "public_transport"),
                 departure_time=request.get("departure_time"),
+                cancelled=cancelled,
             )
+        except RoutingCancelled:
+            self.send_json(409, {"error": "Superseded by a newer request"})
+            return
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             self.send_json(400, {"error": str(error)})
             return
@@ -47,13 +88,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(200, {"minutes": minutes})
 
 
-if __name__ == "__main__":
+def main():
+    """Validate the routing setup and start the local HTTP service."""
+
     _routing_libraries()
     data_directory = _data_directory()
-    with ThreadingHTTPServer(("127.0.0.1", 8001), Handler) as server:
+    with ThreadingHTTPServer(("127.0.0.1", 8001), TravelTimeHandler) as server:
         print(f"R5 data: {data_directory}", flush=True)
         print("Travel-time engine: http://127.0.0.1:8001", flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
             pass
+
+
+if __name__ == "__main__":
+    main()

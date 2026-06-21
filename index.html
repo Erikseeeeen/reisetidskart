@@ -24,7 +24,6 @@
             <span id="engine-status" data-state="loading">Kobler til</span>
           </div>
           <h1>Reisetidskart</h1>
-          <p class="intro">Klikk i kartet eller dra markøren for å velge startpunkt.</p>
         </header>
 
         <section class="start-card" aria-labelledby="start-heading">
@@ -32,21 +31,30 @@
             <p class="label" id="start-heading">Startpunkt</p>
             <output id="start-coordinates">Oslo S</output>
           </div>
-          <button id="reset-start" type="button">Tilbake til Oslo S</button>
         </section>
 
-        <section class="palette-picker" aria-labelledby="palette-heading">
-          <h2 id="palette-heading">Fargeskala</h2>
-          <div class="palette-options" role="radiogroup" aria-label="Velg fargeskala">
-            <button class="palette-option is-active" type="button" role="radio" aria-checked="true" data-scale="viridis"><span class="palette-swatch" aria-hidden="true"></span><span>Viridis</span></button>
-            <button class="palette-option" type="button" role="radio" aria-checked="false" data-scale="magma"><span class="palette-swatch" aria-hidden="true"></span><span>Magma</span></button>
-            <button class="palette-option" type="button" role="radio" aria-checked="false" data-scale="inferno"><span class="palette-swatch" aria-hidden="true"></span><span>Inferno</span></button>
-            <button class="palette-option" type="button" role="radio" aria-checked="false" data-scale="turbo"><span class="palette-swatch" aria-hidden="true"></span><span>Turbo</span></button>
-            <button class="palette-option" type="button" role="radio" aria-checked="false" data-scale="cividis"><span class="palette-swatch" aria-hidden="true"></span><span>Cividis</span></button>
-            <button class="palette-option" type="button" role="radio" aria-checked="false" data-scale="blueRed"><span class="palette-swatch" aria-hidden="true"></span><span>Blå–rød</span></button>
-            <button class="palette-option" type="button" role="radio" aria-checked="false" data-scale="greyscale"><span class="palette-swatch" aria-hidden="true"></span><span>Gråtoner</span></button>
+        <fieldset class="transport-picker">
+          <legend>Transportmiddel</legend>
+          <div class="transport-options">
+            <label>
+              <input type="radio" name="transport-mode" value="walk" />
+              <span class="transport-option">Gange</span>
+            </label>
+            <label>
+              <input type="radio" name="transport-mode" value="bicycle" />
+              <span class="transport-option">Sykkel</span>
+            </label>
+            <label>
+              <input type="radio" name="transport-mode" value="public_transport" checked />
+              <span class="transport-option">Kollektiv</span>
+            </label>
+            <label>
+              <input type="radio" name="transport-mode" value="car" />
+              <span class="transport-option">Bil</span>
+            </label>
           </div>
-        </section>
+          <p class="departure-note">Kollektiv beregnes med avreise kl. 08.00.</p>
+        </fieldset>
 
         <section class="legend" aria-labelledby="legend-heading">
           <div class="section-heading">
@@ -63,7 +71,6 @@
         </div>
       </aside>
 
-      <p class="palette-pill"><span>Fargeskala</span><strong id="palette-name">Viridis</strong></p>
       <p class="map-hint">Klikk for å flytte startpunktet</p>
     </main>
 
