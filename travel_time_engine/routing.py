@@ -5,17 +5,12 @@ from __future__ import annotations
 import datetime as dt
 import functools
 import gc
-import hashlib
 import json
 import math
 import os
-import shutil
-import subprocess
-import tempfile
+import sys
 import threading
-import urllib.request
 import warnings
-import zipfile
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -24,7 +19,8 @@ DATA_DIRECTORY_ENVIRONMENT_VARIABLE = "R5_DATA_DIR"
 DEPARTURE_TIME_ENVIRONMENT_VARIABLE = "R5_DEPARTURE_TIME"
 DATA_ROOT = Path(__file__).resolve().parent.parent / "data"
 DEFAULT_REGIONS_DIRECTORY = DATA_ROOT / "regions"
-DEFAULT_DATA_DIRECTORY = DATA_ROOT / "oslo"
+DEFAULT_DATA_DIRECTORY = DATA_ROOT
+DEFAULT_R5_JAR = DATA_ROOT / "r5-norway.jar"
 REGIONS_MANIFEST = "regions.json"
 DEFAULT_TIME_ZONE = "Europe/Oslo"
 DEFAULT_DEPARTURE_HOUR = 8
@@ -35,10 +31,6 @@ UNREACHABLE_MINUTES = MAX_TRAVEL_TIME_MINUTES + 1
 # for all 76,800 display pixels roughly doubles latency without a visible gain.
 MAX_ROUTING_CELLS = 30_000
 JUST_IN_TIME_PERCENTILE = 1
-NATURAL_EARTH_LAND_URL = (
-    "https://naturalearth.s3.amazonaws.com/10m_physical/ne_10m_land.zip"
-)
-LOCAL_COASTLINE_DISTANCE_METRES = 2_000
 _R5_LOCK = threading.Lock()
 _TRANSPORT_NETWORK = None
 _TRANSPORT_NETWORK_DIRECTORY = None
@@ -97,6 +89,7 @@ def _routing_libraries():
     """Import the heavyweight routing stack only when it is needed."""
 
     _configure_java_runtime()
+    _configure_r5_classpath()
 
     try:
         import geopandas
@@ -119,10 +112,49 @@ def _routing_libraries():
     return geopandas, r5py, shapely
 
 
+def _configure_r5_classpath() -> None:
+    """Use the locally patched R5 jar when it exists."""
+
+    if not DEFAULT_R5_JAR.is_file():
+        return
+
+    option = "--r5-classpath"
+    classpath = str(DEFAULT_R5_JAR)
+
+    if option in sys.argv:
+        return
+
+    sys.argv.extend([option, classpath])
+
+
+def _set_java_context_class_loader() -> None:
+    """Let Java worker threads spawned from Python request threads see R5."""
+
+    try:
+        import jpype
+
+        if not jpype.isJVMStarted():
+            return
+
+        thread = jpype.JClass("java.lang.Thread")
+        class_loader = jpype.JClass("java.lang.ClassLoader")
+        thread.currentThread().setContextClassLoader(
+            class_loader.getSystemClassLoader()
+        )
+    except (ImportError, RuntimeError):
+        pass
+
+
 def _data_directory() -> Path:
     configured = os.environ.get(DATA_DIRECTORY_ENVIRONMENT_VARIABLE)
     if configured:
         path = Path(configured).expanduser()
+    elif (
+        DEFAULT_R5_JAR.is_file()
+        and any(DEFAULT_DATA_DIRECTORY.glob("*.osm.pbf"))
+        and any(DEFAULT_DATA_DIRECTORY.glob("*.zip"))
+    ):
+        path = DEFAULT_DATA_DIRECTORY
     elif (DEFAULT_REGIONS_DIRECTORY / REGIONS_MANIFEST).is_file():
         path = DEFAULT_REGIONS_DIRECTORY
     else:
@@ -210,244 +242,6 @@ def _region_for_origin(data_directory: Path, origin) -> dict:
     )
 
 
-def _coastline_cache_path(osm_path: Path) -> Path:
-    """Return a cache name tied to the exact local OSM extract."""
-
-    stat = osm_path.stat()
-    fingerprint = hashlib.sha256(
-        f"{osm_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}".encode()
-    ).hexdigest()[:16]
-
-    cache_directory = Path(tempfile.gettempdir()) / "reisetidskart"
-    cache_directory.mkdir(parents=True, exist_ok=True)
-
-    return cache_directory / f"coastline-{fingerprint}.geojson"
-
-
-def _extract_coastline(osm_path: Path) -> Path:
-    """Extract the detailed, directed OSM coastline and cache it as GeoJSON."""
-
-    local_coastline = osm_path.parent / "coastline.geojson"
-
-    if local_coastline.is_file():
-        return local_coastline
-
-    cache_path = _coastline_cache_path(osm_path)
-
-    if cache_path.is_file():
-        return cache_path
-
-    osmium = shutil.which("osmium")
-
-    if osmium is None:
-        raise RuntimeError(
-            "A detailed coastline has not been generated and the 'osmium' "
-            "command is unavailable. Install osmium-tool or place "
-            f"coastline.geojson in {osm_path.parent}."
-        )
-
-    tagged_path = cache_path.with_suffix(".osm.pbf")
-    temporary_path = cache_path.with_suffix(".tmp.geojson")
-
-    try:
-        subprocess.run(
-            [
-                "osmium",
-                "tags-filter",
-                str(osm_path),
-                "w/natural=coastline",
-                "-o",
-                str(tagged_path),
-                "-O",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-
-        subprocess.run(
-            [
-                "osmium",
-                "export",
-                str(tagged_path),
-                "--geometry-types=linestring,polygon",
-                "-o",
-                str(temporary_path),
-                "-f",
-                "geojson",
-                "-O",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-
-        temporary_path.replace(cache_path)
-    except subprocess.CalledProcessError as error:
-        details = (error.stderr or error.stdout or str(error)).strip()
-        raise RuntimeError(f"Unable to extract the OSM coastline: {details}") from error
-    finally:
-        tagged_path.unlink(missing_ok=True)
-        temporary_path.unlink(missing_ok=True)
-
-    return cache_path
-
-
-def _natural_earth_land_path() -> Path:
-    """Download and cache closed land polygons used away from local coastlines."""
-
-    cache_directory = Path(tempfile.gettempdir()) / "reisetidskart"
-    cache_directory.mkdir(parents=True, exist_ok=True)
-    cache_path = cache_directory / "ne_10m_land.zip"
-
-    if cache_path.is_file():
-        return cache_path
-
-    temporary_path = cache_path.with_suffix(".tmp.zip")
-
-    try:
-        with urllib.request.urlopen(NATURAL_EARTH_LAND_URL, timeout=60) as response:
-            with temporary_path.open("wb") as destination:
-                shutil.copyfileobj(response, destination)
-
-        with zipfile.ZipFile(temporary_path) as archive:
-            if archive.testzip() is not None:
-                raise RuntimeError("The downloaded Natural Earth archive is corrupt")
-
-        temporary_path.replace(cache_path)
-    except Exception as error:
-        raise RuntimeError(
-            "Unable to load the Natural Earth land mask. Check the network "
-            f"connection or place ne_10m_land.zip in {cache_directory}."
-        ) from error
-    finally:
-        temporary_path.unlink(missing_ok=True)
-
-    return cache_path
-
-
-class _CoastlineMask:
-    """Classify land globally, refining it near detailed OSM coastlines."""
-
-    def __init__(self, coastline_path: Path, land_path: Path, geopandas, shapely):
-        import numpy
-        from pyproj import Transformer
-
-        coastlines = geopandas.read_file(coastline_path)
-        west, south, east, north = coastlines.total_bounds
-        land = geopandas.read_file(f"zip://{land_path}")
-        regional_envelope = shapely.box(west - 5, south - 5, east + 5, north + 5)
-        land.geometry = shapely.intersection(land.geometry.array, regional_envelope)
-        land = land[~land.geometry.is_empty].copy()
-        coastlines = coastlines.to_crs("EPSG:25832")
-        land = land.to_crs("EPSG:25832")
-        segments = []
-
-        for geometry in coastlines.geometry:
-            if geometry.geom_type == "LineString":
-                lines = [geometry]
-            elif geometry.geom_type in {"Polygon", "MultiPolygon"}:
-                oriented = shapely.orient_polygons(geometry)
-                lines = list(shapely.get_parts(shapely.boundary(oriented)))
-            else:
-                continue
-
-            for line in lines:
-                coordinates = list(line.coords)
-
-                segments.extend(
-                    shapely.LineString([start, end])
-                    for start, end in zip(coordinates, coordinates[1:])
-                    if start != end
-                )
-
-        if not segments:
-            raise RuntimeError(f"No coastline geometry found in {coastline_path}")
-
-        self._numpy = numpy
-        self._shapely = shapely
-        self._transformer = Transformer.from_crs(
-            "EPSG:4326",
-            "EPSG:25832",
-            always_xy=True,
-        )
-        self._segments = segments
-        self._tree = shapely.STRtree(segments)
-        self._starts = numpy.asarray([segment.coords[0] for segment in segments])
-        self._ends = numpy.asarray([segment.coords[1] for segment in segments])
-        self._land = shapely.union_all(shapely.make_valid(land.geometry))
-
-    def covers_coordinates(self, longitudes, latitudes):
-        """Return a boolean array; OSM coastlines have land on their left."""
-
-        points = self._shapely.points(longitudes, latitudes)
-
-        projected = self._shapely.transform(
-            points,
-            self._transformer.transform,
-            interleaved=False,
-        )
-
-        # A regional PBF normally contains only a fragment of the world's
-        # coastline. Using its nearest segment everywhere makes distant sea
-        # inherit the side of an arbitrary extract-edge segment. Closed global
-        # polygons provide the baseline; directed OSM geometry is precise
-        # enough to override it only in the immediate coastal neighbourhood.
-        result = self._shapely.covered_by(projected, self._land)
-        nearest = self._tree.nearest(projected)
-        coordinates = self._shapely.get_coordinates(projected)
-        starts = self._starts[nearest]
-        ends = self._ends[nearest]
-
-        cross_product = (
-            (ends[:, 0] - starts[:, 0]) * (coordinates[:, 1] - starts[:, 1])
-            - (ends[:, 1] - starts[:, 1]) * (coordinates[:, 0] - starts[:, 0])
-        )
-
-        nearest_segments = self._numpy.asarray(self._segments, dtype=object)[nearest]
-        local = self._shapely.distance(projected, nearest_segments) <= (
-            LOCAL_COASTLINE_DISTANCE_METRES
-        )
-
-        return self._numpy.where(local, cross_product >= 0, result)
-
-    def covers(self, longitude: float, latitude: float) -> bool:
-        return bool(self.covers_coordinates([longitude], [latitude])[0])
-
-
-class _LandMask:
-    """Fast national land mask without fragile directed-coastline overrides."""
-
-    def __init__(self, land_path: Path, geopandas, shapely):
-        import numpy
-
-        land = geopandas.read_file(f"zip://{land_path}")
-        norway_envelope = shapely.box(0, 55, 35, 82)
-        land.geometry = shapely.intersection(land.geometry.array, norway_envelope)
-        land = land[~land.geometry.is_empty]
-
-        self._numpy = numpy
-        self._shapely = shapely
-        self._land = shapely.union_all(shapely.make_valid(land.geometry))
-
-    def covers_coordinates(self, longitudes, latitudes):
-        points = self._shapely.points(longitudes, latitudes)
-        return self._shapely.covered_by(points, self._land)
-
-    def covers(self, longitude: float, latitude: float) -> bool:
-        return bool(self.covers_coordinates([longitude], [latitude])[0])
-
-
-@functools.lru_cache(maxsize=1)
-def _load_coastline_mask():
-    geopandas, _, shapely = _routing_libraries()
-    return _LandMask(
-        _natural_earth_land_path(),
-        geopandas,
-        shapely,
-    )
-
-
 def _load_transport_network(data_directory: Path):
     """Keep one R5 region resident, releasing it before loading another."""
 
@@ -475,6 +269,7 @@ def _load_transport_network(data_directory: Path):
         pass
 
     _, r5py, _ = _routing_libraries()
+    _set_java_context_class_loader()
     osm_files = sorted(data_directory.glob("*.osm.pbf"))
     gtfs_files = sorted(data_directory.glob("*.zip"))
 
@@ -673,42 +468,13 @@ def _upsample_grid(
     return result
 
 
-def _finalize_grid(minutes, bounds, width, height, coastline_mask):
-    """Apply the 60-minute limit and water mask to final-resolution cells."""
-
-    numpy = coastline_mask._numpy
-
-    longitudes = numpy.tile(
-        bounds["west"]
-        + (numpy.arange(width) + 0.5)
-        / width
-        * (bounds["east"] - bounds["west"]),
-        height,
-    )
-
-    north_y = _mercator_y(bounds["north"])
-    south_y = _mercator_y(bounds["south"])
-    mercator_span = north_y - south_y
-
-    row_latitudes = [
-        _inverse_mercator_y(
-            north_y - ((row + 0.5) / height) * mercator_span
-        )
-        for row in range(height)
-    ]
-
-    latitudes = numpy.repeat(row_latitudes, width)
-
-    land_cells = coastline_mask.covers_coordinates(longitudes, latitudes)
+def _finalize_grid(minutes, width, height):
+    """Apply the 60-minute limit to final-resolution cells."""
 
     result = [UNREACHABLE_MINUTES] * (width * height)
 
     for index, value in enumerate(minutes):
-        if (
-            land_cells[index]
-            and math.isfinite(value)
-            and value <= MAX_TRAVEL_TIME_MINUTES
-        ):
+        if math.isfinite(value) and value <= MAX_TRAVEL_TIME_MINUTES:
             result[index] = round(value, 3)
 
     return result
@@ -742,13 +508,9 @@ def compute_grid(
     data_root = _data_directory()
     region = _region_for_origin(data_root, origin)
     data_directory = region["directory"]
-    coastline_mask = _load_coastline_mask()
 
     if cancelled():
         raise RoutingCancelled
-
-    if not coastline_mask.covers(origin["lng"], origin["lat"]):
-        return [UNREACHABLE_MINUTES] * (width * height)
 
     routing_width, routing_height = _routing_dimensions(width, height)
 
@@ -767,6 +529,8 @@ def compute_grid(
         # from a browser should get to perform an expensive R5 calculation.
         if cancelled():
             raise RoutingCancelled
+
+        _set_java_context_class_loader()
 
         if transport_network is None:
             transport_network = _load_transport_network(data_directory)
@@ -799,8 +563,6 @@ def compute_grid(
 
     return _finalize_grid(
         upsampled,
-        bounds,
         width,
         height,
-        coastline_mask,
     )

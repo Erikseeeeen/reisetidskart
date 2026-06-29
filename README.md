@@ -1,17 +1,31 @@
 # Reisetidskart
 
-The browser displays a 60-minute travel-time raster calculated by R5. Routing
-data is split into overlapping regions so all mainland Norwegian cities can be
-supported without loading the full Norwegian OSM and Entur GTFS feeds into one
-JVM. Compact priority regions keep Oslo and Trondheim responsive; broader
-regions provide coverage elsewhere.
+The browser displays a 60-minute travel-time raster calculated by R5. The
+default setup uses one national Norwegian R5 network built from the lean OSM
+extract and Entur GTFS feed. A locally patched R5 jar raises R5's conservative
+WGS envelope area limit so the national street layer can load without splitting
+the graph into routing regions.
+
+## Build the patched R5 jar
+
+Place the national source files in `data/`:
+
+- `norway-routing-lean.osm.pbf`;
+- `rb_norway-aggregated-gtfs-basic.zip`.
+
+Then create `data/r5-norway.jar`:
+
+```powershell
+py tools\patch_r5_extent_limit.py
+```
+
+When `data/r5-norway.jar` exists, the server uses it automatically and defaults
+to the national `data/` directory.
 
 ## Build the regional data
 
-Place the national source files in `data/norway/`:
-
-- one `*.osm.pbf` file;
-- one Entur GTFS `*.zip` file.
+Regional data remains available as a fallback if the national network is too
+large for the target machine.
 
 Install `osmium-tool`, then run:
 
@@ -42,8 +56,9 @@ py -m http.server 8000
 Then open <http://127.0.0.1:8000>. Zoom out to move around Norway; clicking a
 city while zoomed out zooms into routing scale and calculates its raster.
 
-When `data/regions/regions.json` exists it is selected automatically. Override
-the location with `R5_DATA_DIR` if needed:
+When `data/r5-norway.jar` exists, national data is selected automatically even
+if regional data has also been built. Override the location with `R5_DATA_DIR`
+if needed:
 
 ```powershell
 $env:R5_DATA_DIR = "D:\routing-data\regions"

@@ -54,10 +54,13 @@ class TravelTimeHandler(BaseHTTPRequestHandler):
             pass
 
     def do_POST(self):
-        if self.path != "/travel-times":
+        if self.path == "/travel-times":
+            self.travel_times()
+        else:
             self.send_json(404, {"error": "Not found"})
             return
 
+    def travel_times(self):
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
             request = json.loads(self.rfile.read(content_length))

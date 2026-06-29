@@ -20,7 +20,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_SOURCE = ROOT / "data" / "norway"
+DEFAULT_SOURCE = ROOT / "data"
 DEFAULT_DESTINATION = ROOT / "data" / "regions"
 
 # Core rectangles cover mainland Norway without relying on a city list. Data
@@ -237,6 +237,10 @@ def build_gtfs(source_path: Path, output_paths: list[Path], regions=REGIONS):
 
 def build_osm(source_path: Path, destination: Path, bounds):
     osmium = shutil.which("osmium")
+    if not osmium and sys.platform == "win32":
+        osgeo4w_osmium = Path(r"C:\OSGeo4W\bin\osmium.exe")
+        if osgeo4w_osmium.is_file():
+            osmium = str(osgeo4w_osmium)
     if not osmium:
         raise RuntimeError("osmium-tool is required to build regional OSM extracts")
     if sys.platform == "win32":

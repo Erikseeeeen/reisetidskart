@@ -216,6 +216,7 @@ h2 {
 
 .leaflet-container { font-family: inherit; cursor: crosshair; }
 .greyscale-tiles { filter: grayscale(1); }
+.heat-overlay { mix-blend-mode: multiply; }
 
 .start-marker { background: transparent; border: 0; }
 .start-marker__pin {

@@ -3,4 +3,5 @@ geopandas>=1.0
 numpy>=2.0
 pyproj>=3.7
 shapely>=2.0
+rich>=15.0
 tzdata>=2025.2

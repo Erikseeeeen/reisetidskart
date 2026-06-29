@@ -7,6 +7,8 @@ const MAX_MINUTES = 60;
 const TIME_STEPS = [0, 10, 20, 30, 40, 50, 60];
 const CLIENT_ID = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
 const MOVE_DEBOUNCE_MS = 300;
+const HEAT_LAYER_OPACITY = 0.62;
+const REVEAL_FRAME_MS = 28;
 
 const VIRIDIS = ["#440154", "#414487", "#2a788e", "#22a884", "#5ec962", "#aadc32", "#fde725"];
 
@@ -19,6 +21,8 @@ let startPoint = OSLO_S;
 let currentGrid;
 let currentBounds;
 let activeRequest;
+let activeRenderFrame;
+let renderSequence = 0;
 let requestSequence = 0;
 let moveRequestTimer;
 
@@ -28,6 +32,7 @@ const map = L.map("map", {
   maxBounds: NORWAY_BOUNDS.pad(0.12),
   maxBoundsViscosity: 0.8,
 }).setView(OSLO_S, 11);
+map.getPane("tilePane")?.classList.add("greyscale-tiles");
 
 L.control.zoom({ position: "bottomright" }).addTo(map);
 L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
@@ -41,8 +46,9 @@ heatCanvas.width = WIDTH;
 heatCanvas.height = HEIGHT;
 const heatContext = heatCanvas.getContext("2d");
 const heatLayer = L.imageOverlay(heatCanvas.toDataURL(), map.getBounds(), {
-  opacity: 0.8,
+  opacity: HEAT_LAYER_OPACITY,
   interactive: false,
+  className: "heat-overlay",
 }).addTo(map);
 
 const marker = L.marker(startPoint, {
@@ -71,12 +77,12 @@ function morningDepartureTime() {
   return `${parts.year}-${parts.month}-${parts.day}T08:00:00`;
 }
 
-function renderField(minutes, bounds) {
+function renderFieldFrame(minutes, bounds, visibleMinute) {
   const colours = VIRIDIS.map(rgb);
   const image = heatContext.createImageData(WIDTH, HEIGHT);
 
   minutes.forEach((minute, index) => {
-    if (minute > MAX_MINUTES) return;
+    if (minute > visibleMinute || minute > MAX_MINUTES) return;
     const bucket = Math.min(Math.floor(Math.max(0, minute) / 10), colours.length - 2);
     image.data.set([...colours[bucket], 255], index * 4);
   });
@@ -84,8 +90,46 @@ function renderField(minutes, bounds) {
   heatContext.putImageData(image, 0, 0);
   heatLayer.setUrl(heatCanvas.toDataURL("image/png"));
   heatLayer.setBounds(bounds);
+  heatLayer.getElement()?.classList.add("heat-overlay");
   currentGrid = minutes;
   currentBounds = bounds;
+}
+
+function cancelRenderAnimation() {
+  if (activeRenderFrame) {
+    cancelAnimationFrame(activeRenderFrame);
+    activeRenderFrame = undefined;
+  }
+  renderSequence += 1;
+}
+
+function renderField(minutes, bounds) {
+  cancelRenderAnimation();
+  heatLayer.setOpacity(HEAT_LAYER_OPACITY);
+
+  const token = renderSequence;
+  let visibleMinute = 0;
+  let lastFrameTime = 0;
+
+  function step(timestamp) {
+    if (token !== renderSequence) return;
+    if (!lastFrameTime || timestamp - lastFrameTime >= REVEAL_FRAME_MS) {
+      renderFieldFrame(minutes, bounds, visibleMinute);
+      fieldValue.textContent = visibleMinute < MAX_MINUTES
+        ? `Viser ${visibleMinute} min`
+        : "Flytt pekeren over kartet";
+      visibleMinute += 1;
+      lastFrameTime = timestamp;
+    }
+
+    if (visibleMinute <= MAX_MINUTES) {
+      activeRenderFrame = requestAnimationFrame(step);
+    } else {
+      activeRenderFrame = undefined;
+    }
+  }
+
+  activeRenderFrame = requestAnimationFrame(step);
 }
 
 function sampleGrid(lat, lng) {
@@ -107,6 +151,7 @@ function setStatus(text, state) {
 async function requestTravelTimes() {
   if (map.getZoom() < 8) {
     activeRequest?.abort();
+    cancelRenderAnimation();
     currentGrid = undefined;
     currentBounds = undefined;
     heatLayer.setOpacity(0);
@@ -115,6 +160,7 @@ async function requestTravelTimes() {
   }
 
   activeRequest?.abort();
+  cancelRenderAnimation();
   const controller = new AbortController();
   activeRequest = controller;
   fieldValue.textContent = "Beregner …";
@@ -148,9 +194,7 @@ async function requestTravelTimes() {
     if (!response.ok || payload.minutes?.length !== WIDTH * HEIGHT) {
       throw new Error(payload.error ?? "Ugyldig svar fra motoren");
     }
-    heatLayer.setOpacity(0.8);
     renderField(payload.minutes, requestBounds);
-    fieldValue.textContent = "Flytt pekeren over kartet";
     setStatus("Tilkoblet", "connected");
   } catch (error) {
     if (error.name === "AbortError") return;
